@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""A7A Clock — native hardware control panel for the Radxa Cubie A7A (Allwinner A733).
+
+Live telemetry is read straight from sysfs every 2 s; every *change* is routed
+through the `a7a-clock` CLI so the control logic lives in exactly one place.
+Native PyQt6 (the board runs KDE/Qt) — no browser, no web server.
+"""
+import glob
+import os
+import subprocess
+
+from PyQt6.QtCore import Qt, QTimer, QProcess
+from PyQt6.QtGui import QFont
+from PyQt6.QtWidgets import (
+    QApplication, QComboBox, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+    QLabel, QPushButton, QPlainTextEdit, QSpinBox, QVBoxLayout, QWidget,
+)
+
+# sensible daily voltage per GPU clock (undervolt = go below these and soak-test)
+# validated undervolt floors (+ small margin) from the 2026-08-12 hunt
+GPU_DEFAULT_MV = {400: 800, 600: 800, 800: 800, 1008: 800, 1200: 920, 1300: 1040}
+
+CLI = "/usr/local/bin/a7a-clock"
+DMC = "/sys/class/devfreq/a020000.dmcfreq"
+NPU = "/sys/class/devfreq/3600000.npu"
+
+# The decided sweet-spot config — the "best performance per watt" we validated.
+# Shown as a fixed reference banner and used to tint live values green when met.
+BEST = {"a76": 3000, "a55": 2800, "gpu": 1008, "ram": 2040, "npu": 1008}
+GREEN = "#5ec26a"
+FG = "#e6e6e6"
+
+
+def read(path, default="—"):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def read_int(path, div=1):
+    v = read(path, None)
+    try:
+        return int(v) // div
+    except (TypeError, ValueError):
+        return None
+
+
+def avail_mhz(node):
+    raw = read(f"{node}/available_frequencies", "")
+    out = []
+    for tok in raw.split():
+        try:
+            out.append(int(tok) // 1_000_000)
+        except ValueError:
+            pass
+    return sorted(set(out))
+
+
+class Metric(QLabel):
+    """A big live value with a caption."""
+    def __init__(self, caption):
+        super().__init__()
+        self.caption = caption
+        self.setTextFormat(Qt.TextFormat.RichText)
+        self.set("—")
+
+    def set(self, value, tone="#e6e6e6"):
+        self.setText(
+            f"<div style='color:#8a8a8a;font-size:11px'>{self.caption}</div>"
+            f"<div style='color:{tone};font-size:19px;font-weight:600'>{value}</div>")
+
+
+def temp_tone(c):
+    if c is None:
+        return "#8a8a8a"
+    return "#5ec26a" if c < 60 else "#e0b23c" if c < 75 else "#e0553c"
+
+
+class ClockGUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("A7A Clock — hardware control")
+        self.setStyleSheet("background:#1b1d22;color:#e6e6e6;")
+        self.resize(760, 620)
+        root = QVBoxLayout(self)
+
+        # title row, with a launcher for the LLM panel (kept a separate process so a
+        # crash in the chat app can never take the hardware panel down with it)
+        titlerow = QHBoxLayout()
+        title = QLabel("Radxa Cubie A7A — clocks, voltage, temperature")
+        title.setFont(QFont("", 15, QFont.Weight.Bold))
+        btn_llm = QPushButton("Local LLM ▸")
+        btn_llm.setToolTip("Open the chat panel (a7a-llm-gui)")
+        btn_llm.setStyleSheet(
+            "QPushButton{background:#262a31;border:1px solid #33363d;border-radius:6px;"
+            "padding:6px 14px}QPushButton:hover{background:#2f343d}")
+        btn_llm.clicked.connect(
+            lambda: subprocess.Popen(["a7a-llm-gui"],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL))
+        titlerow.addWidget(title, 1)
+        titlerow.addWidget(btn_llm)
+        root.addLayout(titlerow)
+
+        # Fixed reference so the validated sweet-spot is never forgotten.
+        best = QLabel(
+            "★ BEST (target):  CPU 3000 / 2800 MHz  ·  GPU 1008 MHz @ 800 mV "
+            "(undervolted)  ·  RAM 2040 MHz  ·  NPU 1008 MHz   "
+            "— live values turn green at target")
+        best.setStyleSheet(
+            "background:#2a2410;color:#e6c766;border:1px solid #5a4a20;"
+            "border-radius:6px;padding:8px;font-weight:600")
+        best.setWordWrap(True)
+        root.addWidget(best)
+
+        # ---- telemetry grid
+        tg = QGroupBox("Live (2 s refresh)")
+        tg.setStyleSheet("QGroupBox{border:1px solid #33363d;border-radius:8px;margin-top:8px;padding:10px}"
+                         "QGroupBox::title{subcontrol-origin:margin;left:10px;color:#8a8a8a}")
+        grid = QGridLayout(tg)
+        self.m_a76 = Metric("CPU big (2×A76)")
+        self.m_a55 = Metric("CPU little (6×A55)")
+        self.m_gov = Metric("CPU governor")
+        self.m_gpu = Metric("GPU clock (boot)")
+        self.m_gpuv = Metric("GPU rail")
+        self.m_ram = Metric("RAM (DMC)")
+        self.m_npu = Metric("NPU")
+        self.m_thot = Metric("hottest zone")
+        for i, m in enumerate((self.m_a76, self.m_a55, self.m_gov, self.m_gpu,
+                               self.m_gpuv, self.m_ram, self.m_npu, self.m_thot)):
+            grid.addWidget(m, i // 4, i % 4)
+        root.addWidget(tg)
+
+        # ---- controls
+        cg = QGroupBox("Change (runtime unless noted)")
+        cg.setStyleSheet(tg.styleSheet())
+        cl = QVBoxLayout(cg)
+
+        # CPU governor
+        self.cpu_combo = QComboBox()
+        self.cpu_combo.addItems(["schedutil", "performance", "ondemand", "powersave"])
+        cl.addLayout(self._row("CPU governor", self.cpu_combo,
+                               lambda: self._apply("cpu", self.cpu_combo.currentText())))
+
+        # RAM (runtime devfreq — pstates trained by boot0)
+        self.ram_box = QHBoxLayout()
+        cl.addLayout(self._btnrow("RAM freq (MHz, runtime)", self.ram_box, "ram"))
+
+        # NPU
+        self.npu_box = QHBoxLayout()
+        cl.addLayout(self._btnrow("NPU freq (MHz, runtime)", self.npu_box, "npu"))
+
+        # GPU boot entry (needs reboot)
+        # GPU clock + voltage together (both boot-time on this SoC; reboot to apply).
+        # Undervolt = pick a lower mV for a clock and soak-test it.
+        self.gpu_combo = QComboBox()
+        self.gpu_combo.addItems(["400  (low power)", "600", "800",
+                                 "1008  (★ peak)", "1200  (max stable)",
+                                 "1300  (stable, slower)"])
+        self.gpu_combo.setCurrentIndex(3)
+        self.gpu_mv = QSpinBox()
+        self.gpu_mv.setRange(700, 1300)
+        self.gpu_mv.setSingleStep(20)
+        self.gpu_mv.setSuffix(" mV")
+        self.gpu_mv.setValue(960)
+        self.gpu_combo.currentIndexChanged.connect(self._sync_gpu_mv)
+        grow = QHBoxLayout()
+        lab = QLabel("GPU clock + voltage (reboot to apply)")
+        lab.setMinimumWidth(260)
+        grow.addWidget(lab)
+        grow.addWidget(self.gpu_combo, 1)
+        grow.addWidget(self.gpu_mv)
+        gb = QPushButton("Apply")
+        gb.clicked.connect(self._apply_gpu)
+        grow.addWidget(gb)
+        cl.addLayout(grow)
+
+        # Soak
+        soak = QPushButton("Run 5-min GPU soak test")
+        soak.clicked.connect(lambda: self._apply("soak", "5"))
+        cl.addWidget(soak)
+        root.addWidget(cg)
+
+        # ---- log
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet("background:#111318;color:#b8c0cc;border:1px solid #33363d;"
+                               "border-radius:6px;font-family:monospace;font-size:12px")
+        self.log.setPlaceholderText("actions and their output appear here")
+        root.addWidget(self.log, 1)
+
+        self.proc = None
+        self._build_freq_buttons()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(2000)
+        self.refresh()
+
+    def _row(self, label, widget, apply_cb):
+        h = QHBoxLayout()
+        lab = QLabel(label)
+        lab.setMinimumWidth(260)
+        h.addWidget(lab)
+        h.addWidget(widget, 1)
+        b = QPushButton("Apply")
+        b.clicked.connect(apply_cb)
+        h.addWidget(b)
+        return h
+
+    def _btnrow(self, label, box, kind):
+        h = QHBoxLayout()
+        lab = QLabel(label)
+        lab.setMinimumWidth(260)
+        h.addWidget(lab)
+        h.addLayout(box, 1)
+        setattr(self, f"_{kind}_kind", kind)
+        return h
+
+    def _build_freq_buttons(self):
+        for node, box, kind in ((DMC, self.ram_box, "ram"), (NPU, self.npu_box, "npu")):
+            while box.count():
+                w = box.takeAt(0).widget()
+                if w:
+                    w.deleteLater()
+            for mhz in avail_mhz(node):
+                b = QPushButton(str(mhz))
+                b.setMaximumWidth(70)
+                b.clicked.connect(lambda _=False, k=kind, v=str(mhz): self._apply(k, v))
+                box.addWidget(b)
+
+    def _sync_gpu_mv(self):
+        clk = int(self.gpu_combo.currentText().split()[0])
+        self.gpu_mv.setValue(GPU_DEFAULT_MV.get(clk, 960))
+
+    def _apply_gpu(self):
+        clk = self.gpu_combo.currentText().split()[0]
+        self._apply("gpu", clk, str(self.gpu_mv.value()))
+
+    def _apply(self, cmd, *vals):
+        if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
+            self.log.appendPlainText("… a command is still running, wait for it")
+            return
+        args = [cmd] + [str(v) for v in vals]
+        self.log.appendPlainText("$ a7a-clock " + " ".join(args))
+        self.proc = QProcess(self)
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(
+            lambda: self.log.appendPlainText(
+                bytes(self.proc.readAllStandardOutput()).decode(errors="replace").rstrip()))
+        self.proc.start(CLI, args)
+
+    def refresh(self):
+        pols = sorted(glob.glob("/sys/devices/system/cpu/cpufreq/policy*"))
+        big = little = None
+        gov = "—"
+        for p in pols:
+            f = read_int(f"{p}/scaling_cur_freq", 1000)
+            mx = read_int(f"{p}/scaling_max_freq", 1000) or 0
+            gov = read(f"{p}/scaling_governor", gov)
+            if mx >= 2900:
+                big = f
+            else:
+                little = f
+        self.m_a76.set(f"{big} MHz" if big else "—",
+                       GREEN if (big or 0) >= BEST["a76"] else FG)
+        self.m_a55.set(f"{little} MHz" if little else "—",
+                       GREEN if (little or 0) >= BEST["a55"] else FG)
+        self.m_gov.set(gov, GREEN if gov in ("performance", "schedutil") else FG)
+
+        gpu = read_int(f"{DMC}/cur_freq", 1_000_000)  # placeholder if no gpu devfreq
+        # GPU clock comes from the boot DTB; show the boot-entry selection + rail
+        boot = "—"
+        try:
+            for line in open("/boot/extlinux/extlinux.conf"):
+                if line.startswith("default"):
+                    tag = line.split()[1]
+                    boot = {"l0c": "600", "g800": "800", "g1008": "1008",
+                            "g1200": "1200"}.get(tag, tag)
+        except OSError:
+            pass
+        try:
+            boot_mhz = int(boot)
+        except ValueError:
+            boot_mhz = 0
+        self.m_gpu.set(f"{boot} MHz", GREEN if boot_mhz == BEST["gpu"] else FG)
+
+        ram = read_int(f"{DMC}/cur_freq", 1_000_000)
+        self.m_ram.set(f"{ram} MHz" if ram else "—",
+                       GREEN if ram == BEST["ram"] else FG)
+        npu = read_int(f"{NPU}/cur_freq", 1_000_000)
+        self.m_npu.set(f"{npu} MHz" if npu else "—",
+                       GREEN if npu == BEST["npu"] else FG)
+
+        # temps
+        hottest, hotname = None, ""
+        gpu_rail = "—"
+        for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+            c = read_int(f"{z}/temp", 1000)
+            nm = read(f"{z}/type", "")
+            if c is not None and (hottest is None or c > hottest):
+                hottest, hotname = c, nm
+        self.m_thot.set(f"{hottest}°C  {hotname}" if hottest else "—", temp_tone(hottest))
+        # rail: cheap read via a7a-clock status would need sudo; leave the boot value
+        self.m_gpuv.set(f"{gpu_rail}" if gpu_rail != "—" else
+                        ("800 mV @1008" if boot == "1008" else f"{boot}"),
+                        GREEN if gpu_rail in ("800mV", "—") else FG)
+
+
+def main():
+    app = QApplication([])
+    w = ClockGUI()
+    w.show()
+    app.exec()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+#!/bin/sh
+# SuperTuxKart on the PowerVR GPU, in "game mode":
+#  - EGL (not GLX) so GLES lands on the hardware GPU, not software llvmpipe
+#  - performance CPU governor so the big A76 cores stay at 3.0GHz instead of
+#    idling at 780MHz (the cause of progressive in-race lag); restored on exit
+export SDL_VIDEO_X11_FORCE_EGL=1
+export LD_LIBRARY_PATH=/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
+PREV=$(cat /sys/devices/system/cpu/cpufreq/policy6/scaling_governor 2>/dev/null)
+set_gov() { for p in /sys/devices/system/cpu/cpufreq/policy*; do echo "$1" | sudo tee "$p/scaling_governor" >/dev/null 2>&1; done; }
+restore() { [ -n "$PREV" ] && set_gov "$PREV"; }
+trap restore EXIT INT TERM
+
+set_gov performance
+/usr/games/supertuxkart "$@"

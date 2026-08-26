@@ -1,0 +1,19 @@
+#!/bin/sh
+# OpenArena (ioquake3 engine) on the PowerVR GPU, in game mode:
+#  - gl4es translates the game's legacy OpenGL 1.x to GLES on the hardware GPU
+#  - LIBGL_GAMMA: the board's display driver ignores hardware gamma ramps, so
+#    Quake-engine games render pitch-dark and their brightness slider is dead;
+#    gl4es applies gamma in the render path instead (raise/lower to taste)
+#  - r_ignorehwgamma 1: makes the in-game brightness slider bake gamma into
+#    textures (applies on map load / vid_restart) instead of the dead hw path
+#  - performance CPU governor while playing, previous governor restored on exit
+export LD_LIBRARY_PATH=/usr/local/lib/gl4es:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export LIBGL_GAMMA=${LIBGL_GAMMA:-1.8}
+
+PREV=$(cat /sys/devices/system/cpu/cpufreq/policy6/scaling_governor 2>/dev/null)
+set_gov() { for p in /sys/devices/system/cpu/cpufreq/policy*; do echo "$1" | sudo tee "$p/scaling_governor" >/dev/null 2>&1; done; }
+restore() { [ -n "$PREV" ] && set_gov "$PREV"; }
+trap restore EXIT INT TERM
+set_gov performance
+
+/usr/games/openarena +set cl_renderer opengl1 +set r_ignorehwgamma 1 +set r_mode -1 +set r_customwidth 1024 +set r_customheight 600 +set r_fullscreen 1 "$@"

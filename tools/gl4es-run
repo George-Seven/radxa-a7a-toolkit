@@ -1,0 +1,4 @@
+#!/bin/sh
+# run a legacy-OpenGL app through gl4es -> GLES -> PowerVR
+export LD_LIBRARY_PATH=/usr/local/lib/gl4es:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+exec "$@"

@@ -1,0 +1,27 @@
+build/
+*.o
+*.pre*
+*.bak
+*.mipfix
+*.bgra_active
+# never publish game assets
+*.img
+*.txd
+*.gxt
+*.dff
+*.col
+*.ipl
+*.ide
+
+# prebuilt third-party binaries for platforms this repo does not target
+**/libs/Android/
+**/dist/Win32/
+**/dist/Win64/
+premake5.exe
+premake5Linux
+premake5MacOSX
+*.dll
+**/libs/iOS/
+**/dist/MacOSX/
+**/lib/Android/
+*.so

@@ -1,0 +1,4 @@
+#!/bin/sh
+export LD_LIBRARY_PATH=/usr/local/lib
+export MESA_LOADER_DRIVER_OVERRIDE=sunxi-drm
+exec /usr/lib/xorg/Xorg "$@"

@@ -1,0 +1,95 @@
+#!/bin/bash
+# a7a-clock — unified clock+voltage control for the Radxa Cubie A7A (Allwinner A733)
+# status                       show all clocks, voltages, temps
+# gpu <MHz> [mV]               set GPU clock + rail voltage (boot entry; reboot to apply).
+#                              mV optional -> sensible default per clock. UNDERVOLT = pass a lower mV.
+# ram <400|800|1200|1800|2040> set DRAM controller freq (runtime, devfreq)
+# npu <492|852|1008>           set NPU freq (runtime, devfreq)  [1008 = qualified max for this bin]
+# cpu <performance|schedutil|ondemand|powersave>  CPU governor (runtime)
+# soak [minutes]               GPU stress soak with error/temp watch (default 10)
+set -e
+DMC=/sys/class/devfreq/a020000.dmcfreq
+NPU=/sys/class/devfreq/3600000.npu
+EXT=/boot/extlinux/extlinux.conf
+GPU_NODE=/soc@3000000/gpu@1800000
+DC_NODE=/soc@3000000/twi@7083000/pmu@36/regulators@0/dcdc4
+BASE_DTB=/usr/lib/linux-image-custom/allwinner/sun60i-a733-cubie-a7a.dtb   # pristine base
+KERNEL=/boot/vmlinuz-6.6.98+-rbfix
+APPEND='root=/dev/mmcblk0p3 console=ttyAS0,115200n8 rootwait clk_ignore_unused loglevel=7 rw earlycon consoleblank=0 console=tty1 coherent_pool=2M irqchip.gicv3_pseudo_nmi=0'
+
+# validated undervolt floors (+small margin) from the 2026-08-12 hunt; 1008@800 = daily
+default_mv() { case "$1" in 400) echo 800;; 600) echo 800;; 800) echo 800;; 1008) echo 800;; 1200) echo 920;; 1300) echo 1040;; 1400) echo 1150;; *) echo 800;; esac; }
+
+status() {
+  echo "=== a7a-clock status ==="
+  echo "-- CPU:"
+  for p in /sys/devices/system/cpu/cpufreq/policy*; do
+    echo "  $(basename $p): $(($(cat $p/scaling_cur_freq)/1000)) MHz  gov=$(cat $p/scaling_governor)  max=$(($(cat $p/scaling_max_freq)/1000)) MHz"
+  done
+  echo "-- GPU:"
+  echo "  boot entry: $(grep '^default' $EXT | cut -d' ' -f2)  (running: $(sudo dmesg | grep -oE 'sunxi_parse_dts clk_rate:[0-9]+' | head -1 | cut -d: -f2 | awk '{print $1/1000000 " MHz"}'))"
+  sudo grep -A1 'axp8191-dcdc4' /sys/kernel/debug/regulator/regulator_summary | head -1 | awk '{print "  rail: " $6}'
+  echo "-- RAM (DMC): $(($(cat $DMC/cur_freq)/1000000)) MHz  (available: $(cat $DMC/available_frequencies | sed 's/000000//g'))"
+  echo "-- NPU: $(($(cat $NPU/cur_freq)/1000000)) MHz  (available: $(cat $NPU/available_frequencies | sed 's/000000//g'))"
+  echo "-- Temps:"
+  for z in /sys/class/thermal/thermal_zone*; do
+    printf "  %s: %d°C\n" "$(cat $z/type 2>/dev/null)" "$(($(cat $z/temp)/1000))"
+  done
+}
+
+set_devfreq() {
+  local hz=$(($2*1000000))
+  grep -q "$hz" "$1/available_frequencies" || { echo "freq $2 MHz not available: $(cat $1/available_frequencies | sed 's/000000//g')"; exit 1; }
+  echo userspace | sudo tee "$1/governor" > /dev/null
+  echo "$hz" | sudo tee "$1/userspace/set_freq" > /dev/null
+  echo "set to $(($(cat $1/cur_freq)/1000000)) MHz"
+}
+
+gpu_set() {   # $1=MHz  $2=mV(optional)
+  local clk="$1" mv="${2:-$(default_mv "$1")}"
+  [ -f "$BASE_DTB" ] || { echo "base DTB missing: $BASE_DTB"; exit 1; }
+  local name="gpu${clk}v${mv}" dir="/usr/lib/linux-image-gpu${clk}v${mv}"
+  sudo mkdir -p "$dir/allwinner"
+  sudo cp "$BASE_DTB" "$dir/allwinner/sun60i-a733-cubie-a7a.dtb"
+  local d="$dir/allwinner/sun60i-a733-cubie-a7a.dtb"
+  sudo fdtput -t i "$d" "$GPU_NODE" clk_rate $((clk*1000000))
+  sudo fdtput -t i "$d" "$DC_NODE" regulator-min-microvolt $((mv*1000))
+  local label="g_${clk}_${mv}"
+  sudo chattr -i "$EXT"
+  if ! grep -q "^label $label\$" "$EXT"; then
+    printf '\nlabel %s\n\tmenu label GPU %s MHz @ %s mV (colorfix)\n\tlinux %s\n\tfdtdir %s/\n\tappend %s\n' \
+      "$label" "$clk" "$mv" "$KERNEL" "$dir" "$APPEND" | sudo tee -a "$EXT" > /dev/null
+  fi
+  sudo sed -i "s/^default .*/default $label/" "$EXT"
+  sudo chattr +i "$EXT"
+  sync
+  echo "GPU -> $clk MHz @ $mv mV (boot entry $label). REBOOT to apply."
+  echo "  (undervolt tip: if it artifacts, a7a-clock gpu $clk $((mv+40)) gives it more; lower mV = less power/heat)"
+}
+
+case "${1:-status}" in
+  status) status ;;
+  gpu) [ -n "$2" ] || { echo "usage: a7a-clock gpu <MHz> [mV]"; exit 1; }; gpu_set "$2" "$3" ;;
+  ram) set_devfreq "$DMC" "$2" ;;
+  npu) set_devfreq "$NPU" "$2" ;;
+  cpu) for p in /sys/devices/system/cpu/cpufreq/policy*; do echo "$2" | sudo tee "$p/scaling_governor" > /dev/null; done; echo "CPU governor -> $2" ;;
+  soak)
+    MIN=${2:-10}
+    SPID=$(pgrep -x plasmashell | head -1)
+    AUTH=$(tr '\0' '\n' < /proc/$SPID/environ 2>/dev/null | grep '^XAUTHORITY=' | cut -d= -f2)
+    [ -z "$AUTH" ] && AUTH=/var/run/lightdm/root/:0
+    export DISPLAY=:0 XAUTHORITY="$AUTH" LD_LIBRARY_PATH=/usr/local/lib
+    E0=$(sudo dmesg | grep -cE 'PVR_K.*(Fatal|Device experienced error|HWR|Reset)' || true)
+    END=$(( $(date +%s) + MIN*60 )); RUNS=0; TMAX=0
+    while [ "$(date +%s)" -lt "$END" ]; do
+      T0=$(date +%s); sudo -E timeout 120 glmark2-es2 --off-screen -b build -b shading -b bump > /tmp/soak_last.log 2>&1
+      DUR=$(( $(date +%s) - T0 ))
+      [ "$DUR" -lt 15 ] && { echo "SOAK ABORT: run only ${DUR}s (no X/GPU load). Is a desktop up?"; exit 1; }
+      RUNS=$((RUNS+1)); T=$(($(cat /sys/class/thermal/thermal_zone4/temp)/1000)); [ "$T" -gt "$TMAX" ] && TMAX=$T
+      echo "  run $RUNS (${DUR}s), gpu ${T}°C"
+    done
+    E1=$(sudo dmesg | grep -cE 'PVR_K.*(Fatal|Device experienced error|HWR|Reset)' || true)
+    echo "SOAK: $RUNS runs, new errors $((E1-E0)), max gpu ${TMAX}°C"
+    [ "$((E1-E0))" -eq 0 ] && echo "VERDICT: STABLE" || echo "VERDICT: ERRORS — raise mV or lower clock" ;;
+  *) echo "usage: a7a-clock [status|gpu MHz [mV]|ram MHz|npu MHz|cpu GOV|soak MIN]"; exit 1 ;;
+esac
