@@ -1,0 +1,137 @@
+diff --git a/src/gl/gl3device.cpp b/src/gl/gl3device.cpp
+index 6a4c8dd..47ca665 100644
+--- a/src/gl/gl3device.cpp
++++ b/src/gl/gl3device.cpp
+@@ -74,13 +74,13 @@ const char *shaderDecl120 =
+ "#define VSIN(index) attribute\n"
+ "#define VSOUT varying\n"
+ "#define FSIN varying\n"
+-"#define FRAGCOLOR(c) (gl_FragColor = c)\n";
++"#define FRAGCOLOR(c) (gl_FragColor = (c).bgra)\n";
+ const char *shaderDecl330 =
+ "#version 330\n"
+ "#define VSIN(index) layout(location = index) in\n"
+ "#define VSOUT out\n"
+ "#define FSIN in\n"
+-"#define FRAGCOLOR(c) (fragColor = c)\n";
++"#define FRAGCOLOR(c) (fragColor = (c).bgra)\n";
+ const char *shaderDecl100es =
+ "#version 100\n"
+ "#define GL2\n"
+@@ -88,7 +88,7 @@ const char *shaderDecl100es =
+ "#define VSIN(index) attribute\n"
+ "#define VSOUT varying\n"
+ "#define FSIN varying\n"
+-"#define FRAGCOLOR(c) (gl_FragColor = c)\n"
++"#define FRAGCOLOR(c) (gl_FragColor = (c).bgra)\n"
+ "precision highp float;\n"
+ "precision highp int;\n";
+ const char *shaderDecl310es =
+@@ -96,7 +96,7 @@ const char *shaderDecl310es =
+ "#define VSIN(index) layout(location = index) in\n"
+ "#define VSOUT out\n"
+ "#define FSIN in\n"
+-"#define FRAGCOLOR(c) (fragColor = c)\n"
++"#define FRAGCOLOR(c) (fragColor = (c).bgra)\n"
+ "precision highp float;\n"
+ "precision highp int;\n";
+ 
+@@ -1695,10 +1695,7 @@ static struct {
+ 	int gl;
+ 	int major, minor;
+ } profiles[] = {
+-	{ GLFW_OPENGL_API, 3, 3 },
+-	{ GLFW_OPENGL_API, 2, 1 },
+ 	{ GLFW_OPENGL_ES_API, 3, 1 },
+-	{ GLFW_OPENGL_ES_API, 2, 0 },
+ 	{ 0, 0, 0 },
+ };
+ 
+@@ -1722,6 +1719,7 @@ startGLFW(void)
+ 		glfwWindowHint(GLFW_SAMPLES, glGlobals.numSamples);
+ 
+ 	int i;
++	glfwWindowHint(GLFW_CONTEXT_CREATION_API, GLFW_EGL_CONTEXT_API);  // A7A: force EGL->PowerVR (not GLX->llvmpipe)
+ 	for(i = 0; profiles[i].gl; i++){
+ 		glfwWindowHint(GLFW_CLIENT_API, profiles[i].gl);
+ 		glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, profiles[i].major);
+@@ -1751,6 +1749,8 @@ startGLFW(void)
+ 	}
+ 
+ 	printf("OpenGL version: %s\n", glGetString(GL_VERSION));
++	printf("RW: GL_RENDERER = %s\n", (const char*)glGetString(GL_RENDERER));
++	printf("RW: GL_VENDOR   = %s\n", (const char*)glGetString(GL_VENDOR)); fflush(stdout);
+ 
+ 	glGlobals.window = win;
+ 	*glGlobals.pWindow = win;
+diff --git a/src/gl/gl3raster.cpp b/src/gl/gl3raster.cpp
+index b7c3941..578c78a 100644
+--- a/src/gl/gl3raster.cpp
++++ b/src/gl/gl3raster.cpp
+@@ -119,13 +119,30 @@ rasterCreateTexture(Raster *raster)
+ 	natras->autogenMipmap = (raster->format & (Raster::MIPMAP|Raster::AUTOMIPMAP)) == (Raster::MIPMAP|Raster::AUTOMIPMAP);
+ 	if(natras->autogenMipmap)
+ 		natras->numLevels = 1;
++	// A7A TEST: force a single level under GLES (isolates the black-mip theory)
++	if(gl3Caps.gles)
++		natras->numLevels = 1;
+ 
+ 	glGenTextures(1, &natras->texid);
+ 	uint32 prev = bindTexture(natras->texid);
+ 	glTexImage2D(GL_TEXTURE_2D, 0, natras->internalFormat,
+ 	             raster->width, raster->height,
+ 	             0, natras->format, natras->type, nil);
+-	// TODO: allocate other levels...probably
++	// A7A: allocate EVERY level up to GL_TEXTURE_MAX_LEVEL. A source raster
++	// with a shorter chain than numLevels (common for DXT TXDs, which stop
++	// at 4x4) otherwise leaves holes; the texture is then mipmap-incomplete
++	// and GLES samples it as opaque black (0,0,0,1) - solid dark quads.
++	{
++		int mipw = raster->width;
++		int miph = raster->height;
++		for(int lvl = 1; lvl < natras->numLevels; lvl++){
++			if(mipw > 1) mipw /= 2;
++			if(miph > 1) miph /= 2;
++			glTexImage2D(GL_TEXTURE_2D, lvl, natras->internalFormat,
++				             mipw, miph,
++				             0, natras->format, natras->type, nil);
++		}
++	}
+ 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, natras->numLevels-1);
+ 	natras->filterMode = 0;
+ 	natras->addressU = 0;
+@@ -555,7 +572,9 @@ rasterUnlock(Raster *raster, int32 level)
+ 					     raster->width, raster->height,
+ 					     0, natras->format, natras->type, raster->pixels);
+ 			}
+-			if(level == 0 && natras->autogenMipmap)
++			// A7A: also build the chain when the raster declares mip levels but the
++			// source supplied fewer; authored levels uploaded later still win.
++			if(level == 0 && !natras->isCompressed && (natras->autogenMipmap || natras->numLevels > 1))
+ 				glGenerateMipmap(GL_TEXTURE_2D);
+ 			bindTexture(prev);
+ 		}
+@@ -710,6 +729,23 @@ rasterFromImage(Raster *raster, Image *image)
+ 	int x, y;
+ 	assert(image->width == raster->width);
+ 	assert(image->height == raster->height);
++	// A7A: fast path. The generic loop below calls conv() through a function
++	// pointer for EVERY pixel (262144 indirect calls for one 512x512 texture)
++	// on the MAIN thread while streaming. When the conversion is a plain
++	// 32-bit copy - the GLES case for every DXT-decoded texture - copy whole
++	// rows instead. Byte-identical output.
++	if(conv == conv_RGBA8888_from_RGBA8888 && image->bpp == 4 && natras->bpp == 4){
++		for(y = 0; y < image->height; y++){
++			memcpy(pixels, imgpixels, (size_t)image->width*4);
++			imgpixels -= image->stride;
++			pixels += raster->stride;
++		}
++		if(unlock)
++			raster->unlock(0);
++		if(truecolimg)
++			truecolimg->destroy();
++		return 1;
++	}
+ 	for(y = 0; y < image->height; y++){
+ 		uint8 *imgrow = imgpixels;
+ 		uint8 *rasrow = pixels;

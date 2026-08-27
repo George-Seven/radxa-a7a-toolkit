@@ -1,0 +1,105 @@
+#!/bin/bash
+# GTA Vice City (reVC) - big.LITTLE aware launcher for the Radxa A7A (A733).
+#   main thread + GPU driver threads -> A76 big cores (6,7)
+#   CdStream + audio helper threads  -> A55 little cores (1-5)
+#   core 0 reserved: game never touches it, so sshd/systemd always have a core
+GDIR='/home/radxa/vc_pc/Grand Theft Auto Vice City reVC++'
+export DISPLAY=:0 XAUTHORITY=/home/radxa/.Xauthority
+cd "$GDIR" || exit 2
+
+# derive big/little from cpu capacity (falls back to the known A733 layout)
+caps=$(for c in /sys/devices/system/cpu/cpu[0-9]*; do
+  n=${c##*/cpu}; f=$(cat "$c/cpufreq/cpuinfo_max_freq" 2>/dev/null || echo 0); echo "$n $f"; done)
+mx=$(echo "$caps" | awk '{if($2+0>m)m=$2+0}END{print m+0}')
+BIG=$(echo "$caps" | awk -v m="$mx" '$2+0==m{printf "%s%s",s,$1;s=","}')
+LIT=$(echo "$caps" | awk -v m="$mx" '$2+0!=m && $1!=0{printf "%s%s",s,$1;s=","}')
+[ -z "$BIG" ] && BIG=6,7
+[ -z "$LIT" ] && LIT=1,2,3,4,5
+
+
+# --- RAMGAME: serve the read-hot game data from RAM (SD reads cause hitches) ---
+RAMDIR=/mnt/ramgame
+stage_one(){   # $1 = path relative to GDIR, $2 = unique name in RAMDIR
+  local link="$GDIR/$1" real="$GDIR/$1.sd" dst="$RAMDIR/$2"
+  [ -e "$real" ] || { [ -e "$link" ] || return 0; mv "$link" "$real" || return 0; }
+  if [ ! -e "$dst" ]; then
+    cp -a "$real" "$dst" 2>/dev/null || { rm -rf "$dst"; ln -sfn "$real" "$link"; return 0; }
+  fi
+  ln -sfn "$dst" "$link"
+}
+STAGE_LIST="Audio:Audio anim:anim ViceEx:ViceEx models/ViceEx:modelsViceEx"   # gta3.img stays on SD: 3.1GB in RAM starved the system
+need=0
+for e in $STAGE_LIST; do
+  rel=${e%%:*}; src="$GDIR/$rel.sd"; [ -e "$src" ] || src="$GDIR/$rel"
+  [ -e "$src" ] && need=$(( need + $(du -sm "$src" 2>/dev/null | cut -f1) ))
+done
+need=$(( need + 400 ))
+avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+if [ "$avail" -gt $(( need + 4000 )) ]; then   # keep >=4GB free for the game itself
+  if mountpoint -q "$RAMDIR"; then
+    cur=$(df -m "$RAMDIR" | awk 'NR==2{print $2}')
+    [ "$cur" -lt "$need" ] && { sudo umount "$RAMDIR" 2>/dev/null && sudo mount -t tmpfs -o size=${need}M tmpfs "$RAMDIR"; }
+  else
+    sudo mkdir -p "$RAMDIR"; sudo mount -t tmpfs -o size=${need}M tmpfs "$RAMDIR"
+  fi
+  sudo chown "$(id -u):$(id -g)" "$RAMDIR" 2>/dev/null || true
+  for e in $STAGE_LIST; do
+    rel=${e%%:*}; nm=${e##*:}
+    [ -e "$RAMDIR/$nm" ] || echo "[vicecity-gpu] staging $rel into RAM..."
+    stage_one "$rel" "$nm"
+  done
+  echo "[vicecity-gpu] RAM-staged: $(ls $RAMDIR 2>/dev/null | tr '
+' ' ')"
+else
+  echo "[vicecity-gpu] not enough free RAM (${avail}M < ${need}M) - running from SD"
+  for e in $STAGE_LIST; do
+    rel=${e%%:*}
+    [ -e "$GDIR/$rel.sd" ] && ln -sfn "$GDIR/$rel.sd" "$GDIR/$rel"
+  done
+fi
+
+PREV=$(cat /sys/devices/system/cpu/cpufreq/policy6/scaling_governor 2>/dev/null)
+setg(){ for p in /sys/devices/system/cpu/cpufreq/policy*; do echo "$1" | sudo tee "$p/scaling_governor" >/dev/null 2>&1; done; }
+setg performance
+
+# keep the desktop off the big cores while we play (best-effort, non-fatal)
+for pat in plasmashell kwin_x11 Xorg pulseaudio pipewire; do
+  for pid in $(pgrep -x "$pat" 2>/dev/null); do taskset -apc "$LIT" "$pid" >/dev/null 2>&1; done
+done
+
+taskset -c "$BIG" "$@" /home/radxa/reVC/build/src/reVC &
+GP=$!
+# push the game's helper threads (CdStream, audio) onto the little cores;
+# the main thread (tid == pid) and the PowerVR driver threads stay on big.
+(
+  end=$(( $(date +%s) + 120 ))
+  while [ -d "/proc/$GP" ]; do
+    for t in /proc/$GP/task/*; do
+      tid=${t##*/}; [ "$tid" = "$GP" ] && continue
+      comm=$(cat "$t/comm" 2>/dev/null)
+      case "$comm" in reVC|alsoft*|*mpg123*|*stream*) taskset -pc "$LIT" "$tid" >/dev/null 2>&1;; esac
+    done
+    [ "$(date +%s)" -lt "$end" ] && sleep 3 || sleep 20
+  done
+) &
+WP=$!
+# --- MEMGUARD: the engine never frees streamed textures, so RSS grows without
+# bound. If free RAM gets critically low, stop the GAME rather than let the
+# whole board wedge (sshd starves and only a power-cycle recovers it).
+(
+  while [ -d "/proc/$GP" ]; do
+    avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+    if [ "${avail:-9999}" -lt 700 ]; then
+      echo "[vicecity-gpu] MEMGUARD: only ${avail}MB free - stopping the game to protect the board" >&2
+      kill -TERM "$GP" 2>/dev/null; sleep 5; kill -9 "$GP" 2>/dev/null
+      break
+    fi
+    sleep 10
+  done
+) &
+MEMPID=$!
+
+cleanup(){ kill $WP $MEMPID 2>/dev/null; [ -n "$PREV" ] && setg "$PREV"; 
+  for pat in plasmashell kwin_x11 Xorg; do for pid in $(pgrep -x "$pat" 2>/dev/null); do taskset -apc 0-7 "$pid" >/dev/null 2>&1; done; done; }
+trap cleanup EXIT INT TERM
+wait $GP

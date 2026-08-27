@@ -1,0 +1,315 @@
+diff --git a/src/core/CdStream_posix.cpp b/src/core/CdStream_posix.cpp
+index 0287adc5..edd14a84 100644
+--- a/src/core/CdStream_posix.cpp
++++ b/src/core/CdStream_posix.cpp
+@@ -1,6 +1,6 @@
+ #ifndef _WIN32
+ #include "common.h"
+-#ifdef GTA_PC || GTA_MOBILE
++#if defined(GTA_PC) || defined(GTA_MOBILE)
+ #include "crossplatform.h"
+ #include <signal.h>
+ #include <pthread.h>
+@@ -60,7 +60,7 @@ re3_sem_close(sem_t* sem)
+ 	free(sem);
+ }
+ 
+-#elifndef ANDROID
++#elif !defined(ANDROID)
+ 
+ #define RE3_SEM_OPEN re3_sem_open
+ sem_t*
+@@ -238,7 +238,7 @@ CdStreamInit(int32 numChannels)
+     debug("%s\n", imgPath);
+ 
+     if((statvfs(imgPath, &fsInfo)) < 0)
+-#elifndef ANDROID
++#elif !defined(ANDROID)
+     if((statvfs("models/gta3.img", &fsInfo)) < 0)
+ #endif
+ 	{
+diff --git a/src/core/Directory.cpp b/src/core/Directory.cpp
+index 05344065..ac0aa93d 100644
+--- a/src/core/Directory.cpp
++++ b/src/core/Directory.cpp
+@@ -42,6 +42,10 @@ void
+ CDirectory::AddItem(const DirectoryInfo &dirinfo)
+ {
+ 	assert(numEntries < maxEntries);
++	if(numEntries >= maxEntries){
++		debug("CDirectory full (%d), dropping %.24s\n", maxEntries, dirinfo.name);
++		return;
++	}
+ #ifdef FIX_BUGS
+ 	// don't add if already exists
+ 	uint32 offset, size;
+diff --git a/src/core/Radar.cpp b/src/core/Radar.cpp
+index 4e15559d..19f7fc65 100644
+--- a/src/core/Radar.cpp
++++ b/src/core/Radar.cpp
+@@ -825,6 +825,10 @@ void CRadar::DrawRadarSection(int32 x, int32 y)
+ 
+ void CRadar::DrawRadarSprite(uint16 sprite, float x, float y, uint8 alpha)
+ {
++	if (sprite >= RADAR_SPRITE_COUNT || RadarSprites[sprite] == nil) {
++		debug("DrawRadarSprite: bad sprite id %d, skipping\n", sprite);
++		return;
++	}
+ #ifdef MAP_ENHANCEMENTS
+ 	if(sprite == RADAR_SPRITE_WAYPOINT) alpha = 255;
+ #endif
+@@ -1147,6 +1151,10 @@ void CRadar::SetBlipSprite(int32 i, int32 icon)
+ {
+ 	int index = CRadar::GetActualBlipArrayIndex(i);
+ 	if (index != -1) {
++		if (icon < 0 || icon >= RADAR_SPRITE_COUNT) {
++			debug("SetBlipSprite: bad sprite id %d, using plain blip\n", icon);
++			icon = RADAR_SPRITE_NONE;
++		}
+ 		ms_RadarTrace[index].m_eRadarSprite = icon;
+ 	}
+ }
+diff --git a/src/core/config.h b/src/core/config.h
+index 73295443..657a5551 100644
+--- a/src/core/config.h
++++ b/src/core/config.h
+@@ -13,10 +13,10 @@ enum Config {
+ 	MAX_CDIMAGES = 8, // additional cdimages
+ 	MAX_CDCHANNELS = 5,
+ 
+-	MODELINFOSIZE = 6500,	// 4900 on PS2
+-	TXDSTORESIZE = 1385,
+-	COLSTORESIZE = 31,
+-	EXTRADIRSIZE = 256,
++	MODELINFOSIZE = 6800,	// 4900 on PS2; A7A: raised from 6500, modded DEFAULT.IDE has ids to 6657 (OOB writes)
++	TXDSTORESIZE = 5000,	// A7A: raised from 1385 for the modded ViceEx txd set (overflow crash)
++	COLSTORESIZE = 44,	// A7A: raised from 31; modded images carry 34 .col archives
++	EXTRADIRSIZE = 1024,	// A7A: raised from 256; ViceEx ships ~190 IDE-less DFFs (dir overflowed)
+ 	CUTSCENEDIRSIZE = 512,
+ 
+ 	SIMPLEMODELSIZE = 3885,
+@@ -24,7 +24,7 @@ enum Config {
+ 	CLUMPMODELSIZE = 5,
+ 	WEAPONMODELSIZE = 37,
+ 	PEDMODELSIZE = 130,
+-	VEHICLEMODELSIZE = 110,
++	VEHICLEMODELSIZE = 130,	// A7A: raised from 110 per mod's limits.ini; 107 already in use
+ 	TWODFXSIZE = 1210,
+ #if defined ANDROID
+ 	MAXVEHICLESLOADED = 70,
+@@ -46,7 +46,7 @@ enum Config {
+ 	NUMCOLMODELS = 4400,
+ 	NUMCUTSCENEOBJECTS = 50,	// not a pool in VC
+ 
+-	NUMANIMBLOCKS = 35,
++	NUMANIMBLOCKS = 60,	// A7A: raised from 35; modded images carry 39 .ifp anim blocks
+ 	NUMANIMATIONS = 450,
+ 
+ 	NUMTEMPOBJECTS = 40,
+diff --git a/src/core/main.cpp b/src/core/main.cpp
+index 7cfb29cf..3cb9f7d8 100644
+--- a/src/core/main.cpp
++++ b/src/core/main.cpp
+@@ -1539,6 +1539,17 @@ Render2dStuffAfterFade(void)
+ void
+ Idle(void *arg)
+ {
++	// A7A: lightweight FPS probe -> stdout once per second
++	{
++		static uint32 fpsFrames = 0, fpsLast = 0;
++		uint32 nowMs = CTimer::GetTimeInMillisecondsPauseMode();
++		fpsFrames++;
++		if(fpsLast == 0) fpsLast = nowMs;
++		else if(nowMs - fpsLast >= 1000){
++			printf("FPSPROBE %.1f fps\n", fpsFrames*1000.0f/(nowMs - fpsLast));
++			fpsFrames = 0; fpsLast = nowMs;
++		}
++	}
+ 	CTimer::Update();
+ 
+ 	tbInit();
+@@ -1643,9 +1654,13 @@ Idle(void *arg)
+ 		        TheCamera.SetMotionBlurAlpha(150);
+ 
+ #ifdef SCREEN_DROPLETS
+-		CPostFX::GetBackBuffer(Scene.camera);
+-		ScreenDroplets::Process();
+-		ScreenDroplets::Render();
++		// A7A: the backbuffer grab is a full-screen glCopyTexSubImage2D every frame.
++		// Only pay for it when it is actually raining (droplets need rain).
++		if(CWeather::Rain > 0.0f){
++			CPostFX::GetBackBuffer(Scene.camera);
++			ScreenDroplets::Process();
++			ScreenDroplets::Render();
++		}
+ #endif
+ 
+ 		tbStartTimer(0, "RenderMotionBlur");
+diff --git a/src/peds/Ped.cpp b/src/peds/Ped.cpp
+index aa63c324..1475357a 100644
+--- a/src/peds/Ped.cpp
++++ b/src/peds/Ped.cpp
+@@ -444,6 +444,12 @@ void
+ CPed::SetModelIndex(uint32 mi)
+ {
+ 	CEntity::SetModelIndex(mi);
++	// A7A guard: modded data can leave the ped/player model clump unloaded (null);
++	// RpAnimBlendClumpInit would then RwObjectGetType(null) and SIGSEGV. Skip anim setup.
++	if (m_rwObject == nil) {
++		printf("[PEDFIX] model %u has null clump - skipping anim setup\n", mi);
++		return;
++	}
+ 	RpAnimBlendClumpInit(GetClump());
+ 	RpAnimBlendClumpFillFrameArray(GetClump(), m_pFrames);
+ 	CPedModelInfo *modelInfo = (CPedModelInfo *)CModelInfo::GetModelInfo(GetModelIndex());
+diff --git a/src/renderer/ParticleMgr.cpp b/src/renderer/ParticleMgr.cpp
+index dcfce359..eb5e77c5 100644
+--- a/src/renderer/ParticleMgr.cpp
++++ b/src/renderer/ParticleMgr.cpp
+@@ -62,6 +62,7 @@ void cParticleSystemMgr::LoadParticleData()
+ 		if ( *line != ';' )
+ 		{
+ 			int32 param = CFG_PARAM_FIRST;
++			bool skipLine = false;
+ 
+ 			strcpy(delims, " \t");
+ 			
+@@ -75,10 +76,17 @@ void cParticleSystemMgr::LoadParticleData()
+ 				{
+ 					case CFG_PARAM_PARTICLE_TYPE_NAME:
+ 						ASSERT(type < MAX_PARTICLES);
++						if ( type >= MAX_PARTICLES )
++						{
++							debug("LoadParticleData: no space for particle \"%s\", skipping line\n", value);
++							skipLine = true;
++							break;
++						}
+ 						entry = &m_aParticles[type];
+ 						ASSERT(entry != nil);
+ 						entry->m_Type = (tParticleType)type++;
+-						strcpy(entry->m_aName, value);
++						strncpy(entry->m_aName, value, sizeof(entry->m_aName) - 1);
++						entry->m_aName[sizeof(entry->m_aName) - 1] = '\0';
+ 						break;
+ 
+ 					case CFG_PARAM_RENDER_COLOURING_R:
+@@ -249,7 +257,7 @@ void cParticleSystemMgr::LoadParticleData()
+ 				if ( param > CFG_PARAM_LAST )
+ 					param = CFG_PARAM_FIRST;
+ 		
+-			} while ( value != nil );
++			} while ( value != nil && !skipLine );
+ 		}
+ 		
+ 		lineEnd++;
+diff --git a/src/renderer/PlayerSkin.cpp b/src/renderer/PlayerSkin.cpp
+index ee944ca7..0da1bd36 100644
+--- a/src/renderer/PlayerSkin.cpp
++++ b/src/renderer/PlayerSkin.cpp
+@@ -94,6 +94,11 @@ CPlayerSkin::GetSkinTexture(const char *texName)
+ 	RwRaster *raster;
+ 	int32 width, height, depth, format;
+ 
++	// A7A modded-data guard: invalid skin txd slot -> skip cosmetic skin (else SIGSEGV)
++	printf("[SKINFIX] m_txdSlot=%d TXDSTORESIZE=%d\n", m_txdSlot, TXDSTORESIZE);
++	if (m_txdSlot < 0 || m_txdSlot >= TXDSTORESIZE)
++		return nil;
++
+ 	CTxdStore::PushCurrentTxd();
+ 	CTxdStore::SetCurrentTxd(m_txdSlot);
+ 	tex = RwTextureRead(texName, NULL);
+diff --git a/src/renderer/Shadows.cpp b/src/renderer/Shadows.cpp
+index 5339916a..46ae9302 100644
+--- a/src/renderer/Shadows.cpp
++++ b/src/renderer/Shadows.cpp
+@@ -88,6 +88,35 @@ CShadows::Init(void)
+ 
+ 	CTxdStore::PopCurrentTxd();
+ 
++#ifndef MASTER
++	{
++		static const char *dbgN[] = { "shad_ped", "shad_car", "bloodpool_64" };
++		RwTexture *dbgT[] = { gpShadowPedTex, gpShadowCarTex, gpBloodPoolTex };
++		for(int32 i = 0; i < 3; i++){
++			RwTexture *t = dbgT[i];
++			if(t == nil || t->raster == nil){ printf("SHADOWDBG %s MISSING\n", dbgN[i]); continue; }
++			rw::Raster *r = t->raster;
++			printf("SHADOWDBG %s %dx%d fmt=%04x depth=%d levels=%d"
++				"\n", dbgN[i], r->width, r->height, r->format & 0xFF00, r->depth, r->getNumLevels());
++			uint8 amin = 255, amax = 0, rmax = 0;
++			uint8 *px = r->lock(0, rw::Raster::LOCKREAD);
++			if(px != nil){
++				for(int32 y = 0; y < r->height; y++){
++					uint8 *ln = px + y*r->stride;
++					for(int32 x = 0; x < r->width; x++){
++						if(ln[3] < amin) amin = ln[3];
++						if(ln[3] > amax) amax = ln[3];
++						if(ln[0] > rmax) rmax = ln[0];
++						ln += 4;
++					}
++				}
++				r->unlock(0);
++				printf("SHADOWDBG %s alpha[%d..%d] maxR=%d\n", dbgN[i], amin, amax, rmax);
++			}
++		}
++	}
++#endif
++
+ 	ASSERT(gpShadowCarTex != nil);
+ 	ASSERT(gpShadowPedTex != nil);
+ 	ASSERT(gpShadowHeliTex != nil);
+diff --git a/src/rw/TexRead.cpp b/src/rw/TexRead.cpp
+index 9b190a4a..74421a2d 100644
+--- a/src/rw/TexRead.cpp
++++ b/src/rw/TexRead.cpp
+@@ -60,7 +60,7 @@ RwTextureGtaStreamRead(RwStream *stream)
+ 	}
+ #endif
+ 
+-#ifdef ANISOTROPIC_FILTERING
++#if 0	// A7A: forced max anisotropy on every texture costs fetch bandwidth
+ 	if(tex && RpAnisotGetMaxSupportedMaxAnisotropy() > 1)	// BUG? this was RpAnisotTextureGetMaxAnisotropy, but that doesn't make much sense
+ 		RpAnisotTextureSetMaxAnisotropy(tex, RpAnisotGetMaxSupportedMaxAnisotropy());
+ #endif
+@@ -296,12 +296,11 @@ bool
+ CanVideoCardDoDXT(void)
+ {
+ #ifdef LIBRW
+-	// TODO
+-#ifdef RW_OPENGL
+-	return false;
+-#else
++	// librw handles DXT everywhere: uploaded compressed when the GPU has
++	// S3TC, otherwise CPU-decompressed to RGBA by
++	// rw::Raster::convertTexToCurrentPlatform(). The txd.img conversion
++	// cache is never needed (and its int32 STREAMTELL breaks past 2GB).
+ 	return true;
+-#endif
+ #else
+ 	return _rwD3D8CheckValidTextureFormat(D3DFMT_DXT1) && _rwD3D8CheckValidTextureFormat(D3DFMT_DXT3);
+ #endif
+diff --git a/src/rw/TxdStore.cpp b/src/rw/TxdStore.cpp
+index df49b3a4..ca74bd08 100644
+--- a/src/rw/TxdStore.cpp
++++ b/src/rw/TxdStore.cpp
+@@ -89,6 +89,7 @@ CTxdStore::PopCurrentTxd(void)
+ void
+ CTxdStore::SetCurrentTxd(int slot)
+ {
++	if (slot < 0 || slot >= TXDSTORESIZE) return;
+ 	RwTexDictionarySetCurrent(GetSlot(slot)->texDict);
+ }
+ 
+diff --git a/src/skel/skeleton.cpp b/src/skel/skeleton.cpp
+index 2bb23460..15e6b25f 100644
+--- a/src/skel/skeleton.cpp
++++ b/src/skel/skeleton.cpp
+@@ -403,7 +403,7 @@ RsInitialize(void)
+ 	RsGlobal.width = DEFAULT_SCREEN_WIDTH;
+ 	RsGlobal.height = DEFAULT_SCREEN_HEIGHT;
+ 	
+-	RsGlobal.maxFPS = 30;
++	RsGlobal.maxFPS = 60;	// A7A: was 30; board has headroom, 60 is much smoother
+ 	 
+ 	RsGlobal.quit = FALSE;
+ 
